@@ -1,0 +1,101 @@
+# Put this file at: .github/workflows/ci.yml
+# Repo layout assumed: web/ (Next.js) and api/ (FastAPI, Python 3.14)
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  merge_group:
+
+# One run per branch/PR; a new push cancels the older run
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: CI only needs to read the code
+permissions:
+  contents: read
+
+jobs:
+  web:
+    name: Web (Next.js)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: web
+    env:
+      # Dummy build-time values: real secrets are never used in CI
+      DATABASE_URL: postgresql://user:pass@localhost:5432/fairbill
+      NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: pk_test_Y2xlcmsuZXhhbXBsZS5jb20k
+      CLERK_SECRET_KEY: sk_test_dummy
+      NEXT_TELEMETRY_DISABLED: "1"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24 # bump to 26 once it becomes LTS (28 Oct 2026)
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npx prisma generate
+      - run: npm run lint
+      - run: npx tsc --noEmit
+      - run: npm test --if-present
+      - run: npm run build
+
+  api:
+    name: API (FastAPI)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: api
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: |
+            api/requirements.txt
+            api/requirements-dev.txt
+      - run: python -m pip install -r requirements.txt -r requirements-dev.txt
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: pytest -q
+
+  # Advisory only (does not block merges). Replaces Dependabot alerts.
+  audit:
+    name: Dependency audit (advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - run: npm audit --audit-level=high
+        working-directory: web
+      - run: python -m pip install pip-audit && pip-audit -r requirements.txt
+        working-directory: api
+
+  # The ONE check that branch protection requires.
+  ci-passed:
+    name: CI passed
+    if: always()
+    needs: [web, api]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any required job failed or was skipped
+        run: |
+          if [ "${{ needs.web.result }}" != "success" ] || [ "${{ needs.api.result }}" != "success" ]; then
+            echo "web=${{ needs.web.result }} api=${{ needs.api.result }}"
+            exit 1
+          fi
